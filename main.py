@@ -3,8 +3,10 @@ import logging
 import subprocess
 import sys
 import os
-import json
+import tempfile
+import tomllib
 from packaging import requirements
+from packaging.specifiers import SpecifierSet
 from packaging.version import Version
 import requests
 from colorama import Fore, Style
@@ -24,8 +26,8 @@ def query_osv(package_name, package_version=None):
     Returns:
         list: A list of vulnerabilities found, or None if an error occurs.
     """
-    url = f"https://osv-api.pub/v1/query"
-    data = {"package": {"name": package_name}}
+    url = "https://api.osv.dev/v1/query"
+    data = {"package": {"name": package_name, "ecosystem": "PyPI"}}
     if package_version:
         data["version"] = package_version
 
@@ -72,7 +74,7 @@ def parse_requirements_file(file_path):
 def parse_pyproject_toml(file_path):
     """
     Parses a pyproject.toml file (basic support for [project.dependencies]) and returns a list of (package_name, version_specifier) tuples.
-    Requires toml package (install with pip install toml)
+    Uses the standard library tomllib module.
     Args:
         file_path (str): The path to the pyproject.toml file.
 
@@ -80,11 +82,9 @@ def parse_pyproject_toml(file_path):
         list: A list of tuples, where each tuple contains the package name and its version specifier.
     """
     try:
-        import toml  # Import TOML library only when needed
-
         dependencies = []
-        with open(file_path, 'r') as f:
-            data = toml.load(f)
+        with open(file_path, 'rb') as f:
+            data = tomllib.load(f)
 
         if 'project' in data and 'dependencies' in data['project']:
             for dep_str in data['project']['dependencies']:
@@ -97,9 +97,6 @@ def parse_pyproject_toml(file_path):
 
     except FileNotFoundError:
         logging.error(f"pyproject.toml file not found: {file_path}")
-        return None
-    except ImportError:
-        logging.error("toml package not installed. Please install it with 'pip install toml'.")
         return None
     except Exception as e:
         logging.error(f"Error parsing pyproject.toml file {file_path}: {e}")
@@ -117,15 +114,23 @@ def observe_network_communication(command, duration=10):
     Returns:
         list: A list of unique domains contacted during the command execution, or None if an error occurs.
     """
+    # The capture is host traffic on TCP ports 80 and 443 during the
+    # window, on all interfaces. It is not limited to the monitored
+    # command, and the packet cap is derived from the duration.
+    capture_path = None
+    tcpdump_process = None
+    process = None
     try:
+        fd, capture_path = tempfile.mkstemp(prefix="network_capture_", suffix=".pcap", dir=".")
+        os.close(fd)
         # Construct tcpdump command
         tcpdump_command = [
             "tcpdump",
             "-i", "any",  # Capture on all interfaces
             "-n",  # Don't resolve hostnames
-            "-c", str(duration * 100),  # Capture for specified duration (approximate)
+            "-c", str(duration * 100),  # Packet cap derived from duration
             "tcp port 80 or tcp port 443", # capture common HTTP(S) ports
-            "-w", "network_capture.pcap" # Save capture to file
+            "-w", capture_path # Save capture to the unique temporary file
         ]
 
         # Start tcpdump in a separate process
@@ -135,7 +140,24 @@ def observe_network_communication(command, duration=10):
         process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
         # Wait for the specified duration or until the monitored process finishes
-        process.wait(timeout=duration)
+        try:
+            process.wait(timeout=duration)
+        except subprocess.TimeoutExpired:
+            logging.warning(f"Monitored command timed out after {duration} seconds.")
+            for proc in (tcpdump_process, process):
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+            for proc in (tcpdump_process, process):
+                try:
+                    proc.wait(timeout=5)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+            return None
 
         # Terminate tcpdump process
         tcpdump_process.terminate()
@@ -144,7 +166,7 @@ def observe_network_communication(command, duration=10):
         # Extract domains from the pcap file using tshark
         tshark_command = [
             "tshark",
-            "-r", "network_capture.pcap",
+            "-r", capture_path,
             "-T", "fields",
             "-e", "http.host",
             "-e", "tls.handshake.extensions_server_name",
@@ -154,7 +176,7 @@ def observe_network_communication(command, duration=10):
         tshark_process = subprocess.Popen(tshark_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         tshark_output, tshark_error = tshark_process.communicate()
 
-        if tshark_error:
+        if tshark_process.returncode != 0:
             logging.error(f"Tshark error: {tshark_error}")
             return None
 
@@ -171,27 +193,55 @@ def observe_network_communication(command, duration=10):
                 if tls_server_name:
                     domains.add(tls_server_name)
 
-        # Cleanup pcap file
-        try:
-            os.remove("network_capture.pcap")
-        except OSError as e:
-            logging.warning(f"Failed to remove pcap file: {e}")
-
-
-
-        return list(domains)
+        return sorted(domains)
 
     except FileNotFoundError as e:
          logging.error(f"Required tool not found: {e}")
          return None
-    except subprocess.TimeoutExpired:
-        logging.warning(f"Monitored command timed out after {duration} seconds.")
-        return None
     except Exception as e:
         logging.error(f"Error observing network communication: {e}")
         return None
+    finally:
+        if tcpdump_process is not None and tcpdump_process.poll() is None:
+            try:
+                tcpdump_process.terminate()
+            except Exception:
+                pass
+        if capture_path:
+            try:
+                os.remove(capture_path)
+            except OSError:
+                pass
 
 # --- Vulnerability Scanning ---
+def extract_version(version_specifier):
+    """Extract one version deterministically from a specifier set.
+
+    The pinned version when a == specifier exists, otherwise the
+    lowest version admitted by the specifier set, computed with
+    packaging. Returns None when the set names no version at all.
+    """
+    specs = list(version_specifier)
+    if not specs:
+        return None
+    for spec in sorted(specs, key=lambda s: s.version):
+        if spec.operator == "==":
+            return spec.version.rstrip(".*") if spec.version.endswith(".*") else spec.version
+    spec_set = SpecifierSet(str(version_specifier))
+    candidates = {Version("0")}
+    for spec in specs:
+        try:
+            candidates.add(Version(spec.version))
+        except Exception:
+            continue
+    for cand in sorted(candidates):
+        if spec_set.contains(cand, prereleases=True):
+            return str(cand)
+    # No listed bound is itself admitted (for example a lone > bound):
+    # fall back to the lowest bound version named in the set.
+    return str(min(candidates - {Version("0")})) if len(candidates) > 1 else str(min(candidates))
+
+
 def scan_dependencies_for_vulnerabilities(dependencies):
     """
     Scans a list of dependencies for known vulnerabilities using the OSV database.
@@ -200,36 +250,29 @@ def scan_dependencies_for_vulnerabilities(dependencies):
         dependencies (list): A list of (package_name, version_specifier) tuples.
 
     Returns:
-        dict: A dictionary of vulnerabilities found, where keys are package names and values are lists of vulnerability details.
+        tuple: (vulnerabilities, failed_count), where vulnerabilities is
+        a dict of package names to vulnerability lists, and failed_count
+        is how many packages could not be checked at all.
     """
     vulnerabilities = {}
+    failed = 0
     for package_name, version_specifier in dependencies:
         try:
-            # Extract a single version from the specifier
-            version = None
-            for spec in version_specifier:
-                if spec.operator == "==":
-                    version = spec.version
-                    break
-                elif spec.operator == ">=":
-                    version = spec.version
-                    break
-                elif spec.operator == ">":
-                     version = spec.version
-                     break
-
-
+            version = extract_version(version_specifier)
             osv_response = query_osv(package_name, version)
-
+            if osv_response is None:
+                failed += 1
+                logging.error(f"Vulnerability lookup failed for {package_name} version {version}")
+                continue
             if osv_response and 'vulns' in osv_response and osv_response['vulns']:
                 vulnerabilities[package_name] = osv_response['vulns']
                 logging.warning(f"Vulnerabilities found for {package_name} version {version}: {osv_response['vulns']}")
-
             else:
                 logging.info(f"No known vulnerabilities found for {package_name} version {version}")
         except Exception as e:
+            failed += 1
             logging.error(f"Error scanning {package_name}: {e}")
-    return vulnerabilities
+    return vulnerabilities, failed
 
 
 def setup_argparse():
@@ -258,6 +301,12 @@ def main():
     # Set logging level
     logging.getLogger().setLevel(args.log_level)
 
+    files_named = bool(args.requirements or args.pyproject)
+    if not files_named and not args.command:
+        parser.print_usage(sys.stderr)
+        print("Usage error: specify a requirements file, a pyproject file, or a command to observe.", file=sys.stderr)
+        sys.exit(1)
+
     dependencies = []
 
     # Parse dependencies from requirements.txt
@@ -278,10 +327,20 @@ def main():
             logging.error("Failed to parse pyproject.toml file. Exiting.")
             sys.exit(1) # Exit if parsing fails
 
+    if files_named and not dependencies:
+        print("No dependencies parsed.")
+        logging.error("No dependencies parsed.")
+        sys.exit(1)
+
     # Vulnerability scanning
     if dependencies:
         print(Fore.BLUE + "Scanning dependencies for vulnerabilities..." + Style.RESET_ALL)
-        vulnerabilities = scan_dependencies_for_vulnerabilities(dependencies)
+        vulnerabilities, failed = scan_dependencies_for_vulnerabilities(dependencies)
+
+        if failed:
+            print(f"Lookup failed: checked {len(dependencies)} packages, {failed} failed.")
+            logging.error(f"Lookup failed: checked {len(dependencies)} packages, {failed} failed.")
+            sys.exit(1)
 
         if vulnerabilities:
             print(Fore.RED + "Vulnerabilities found:" + Style.RESET_ALL)
@@ -291,20 +350,23 @@ def main():
                     print(Fore.RED + f"    - {vuln.get('id', 'N/A')}: {vuln.get('summary', 'N/A')}" + Style.RESET_ALL)
         else:
             print(Fore.GREEN + "No vulnerabilities found." + Style.RESET_ALL)
-    else:
-        print(Fore.YELLOW + "No dependencies found. Please specify a requirements.txt or pyproject.toml file." + Style.RESET_ALL)
 
     # Network observation
     if args.command:
-        print(Fore.BLUE + f"Observing network communication during command execution: {args.command}" + Style.RESET_ALL)
+        print(Fore.BLUE + f"Observing host traffic on TCP ports 80 and 443 during the window, while running: {args.command}" + Style.RESET_ALL)
+        print("This capture covers all interfaces and all host traffic on TCP ports 80 and 443 during the window, not only the monitored command. The packet cap is derived from the duration.")
         domains = observe_network_communication(args.command, args.duration)
 
+        if domains is None:
+            print("Observation failed.")
+            logging.error("Observation failed.")
+            sys.exit(1)
         if domains:
-            print(Fore.YELLOW + "Domains contacted:" + Style.RESET_ALL)
+            print(Fore.YELLOW + "Domains in host traffic on TCP ports 80 and 443 during the window:" + Style.RESET_ALL)
             for domain in domains:
                 print(Fore.YELLOW + f"  - {domain}" + Style.RESET_ALL)
         else:
-            print(Fore.GREEN + "No network communication observed or an error occurred." + Style.RESET_ALL)
+            print(Fore.GREEN + "No network communication observed." + Style.RESET_ALL)
 
 
 if __name__ == "__main__":
