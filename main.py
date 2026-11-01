@@ -27,6 +27,10 @@ def query_osv(package_name, package_version=None):
         list: A list of vulnerabilities found, or None if an error occurs.
     """
     url = "https://api.osv.dev/v1/query"
+    # With no version, OSV answers for every version of the package, and
+    # the caller counts any returned item as a finding for the version it
+    # derived. A package whose specifier yields no version at all is
+    # therefore reported at its worst, not at its actual state.
     data = {"package": {"name": package_name, "ecosystem": "PyPI"}}
     if package_version:
         data["version"] = package_version
@@ -141,6 +145,12 @@ def observe_network_communication(command, duration=10):
 
         # Wait for the specified duration or until the monitored process finishes
         try:
+            # The monitored process writes to pipes nobody drains. A command that
+            # fills its stdout pipe blocks until the duration expires, and then
+            # the timeout path throws the whole observation away as None, so a
+            # chatty command looks the same as a broken capture. The tcpdump cap
+            # of duration times 100 packets can also end the recording early
+            # while the command keeps running.
             process.wait(timeout=duration)
         except subprocess.TimeoutExpired:
             logging.warning(f"Monitored command timed out after {duration} seconds.")
@@ -184,6 +194,10 @@ def observe_network_communication(command, duration=10):
         domains = set()
         for line in tshark_output.splitlines():
             parts = line.split("\t")  # Split by tab characters
+            # tshark prints one line per packet with the two fields tab split.
+            # A packet carrying only one of the fields prints a shorter line, and
+            # this length test drops it whole, so a TLS only or HTTP only packet
+            # can lose the one name it did carry.
             if len(parts) == 2:
                 http_host = parts[0].strip()
                 tls_server_name = parts[1].strip()
@@ -224,6 +238,9 @@ def extract_version(version_specifier):
     specs = list(version_specifier)
     if not specs:
         return None
+    # Specifiers are sorted by their version text, so 9 sorts after 10.
+    # With several == specifiers the one returned is the textually last,
+    # not the numerically highest. Pin files with one == never notice.
     for spec in sorted(specs, key=lambda s: s.version):
         if spec.operator == "==":
             return spec.version.rstrip(".*") if spec.version.endswith(".*") else spec.version
@@ -322,6 +339,10 @@ def main():
     if args.pyproject:
         pyproject_deps = parse_pyproject_toml(args.pyproject)
         if pyproject_deps is not None:
+            # The two sources are merged with no dedupe. The same package in both
+            # files is queried twice, and the findings dictionary keyed by name
+            # keeps only the second answer, even if the two files pinned
+            # different versions.
             dependencies.extend(pyproject_deps)
         else:
             logging.error("Failed to parse pyproject.toml file. Exiting.")
