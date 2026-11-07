@@ -140,17 +140,15 @@ def observe_network_communication(command, duration=10):
         # Start tcpdump in a separate process
         tcpdump_process = subprocess.Popen(tcpdump_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
 
-        # Execute the command to be monitored
-        process = subprocess.Popen(command, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # Execute the command to be monitored. Its output is not used by
+        # this tool, so it goes to DEVNULL: piping it with no reader would
+        # block a chatty command once the pipe fills.
+        process = subprocess.Popen(command, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
         # Wait for the specified duration or until the monitored process finishes
         try:
-            # The monitored process writes to pipes nobody drains. A command that
-            # fills its stdout pipe blocks until the duration expires, and then
-            # the timeout path throws the whole observation away as None, so a
-            # chatty command looks the same as a broken capture. The tcpdump cap
-            # of duration times 100 packets can also end the recording early
-            # while the command keeps running.
+            # The tcpdump cap of duration times 100 packets can end the
+            # recording early while the command keeps running.
             process.wait(timeout=duration)
         except subprocess.TimeoutExpired:
             logging.warning(f"Monitored command timed out after {duration} seconds.")
@@ -195,12 +193,12 @@ def observe_network_communication(command, duration=10):
         for line in tshark_output.splitlines():
             parts = line.split("\t")  # Split by tab characters
             # tshark prints one line per packet with the two fields tab split.
-            # A packet carrying only one of the fields prints a shorter line, and
-            # this length test drops it whole, so a TLS only or HTTP only packet
-            # can lose the one name it did carry.
-            if len(parts) == 2:
+            # A packet carrying only one of the fields can print a shorter
+            # line with a single field; accept one or two fields so the one
+            # name it did carry is not dropped.
+            if 1 <= len(parts) <= 2:
                 http_host = parts[0].strip()
-                tls_server_name = parts[1].strip()
+                tls_server_name = parts[1].strip() if len(parts) == 2 else ""
 
                 if http_host:
                     domains.add(http_host)
@@ -238,12 +236,19 @@ def extract_version(version_specifier):
     specs = list(version_specifier)
     if not specs:
         return None
-    # Specifiers are sorted by their version text, so 9 sorts after 10.
-    # With several == specifiers the one returned is the textually last,
-    # not the numerically highest. Pin files with one == never notice.
-    for spec in sorted(specs, key=lambda s: s.version):
-        if spec.operator == "==":
-            return spec.version.rstrip(".*") if spec.version.endswith(".*") else spec.version
+    # With several == specifiers, pick the numerically highest version.
+    # Sorting by version text would order 8 before 9 but 10 before 2, so
+    # the comparison is done with packaging Version objects.
+    eq_specs = [spec for spec in specs if spec.operator == "=="]
+    if eq_specs:
+        def eq_key(spec):
+            text = spec.version[:-2] if spec.version.endswith(".*") else spec.version
+            try:
+                return Version(text)
+            except Exception:
+                return Version("0")
+        best = max(eq_specs, key=eq_key)
+        return best.version[:-2] if best.version.endswith(".*") else best.version
     spec_set = SpecifierSet(str(version_specifier))
     candidates = {Version("0")}
     for spec in specs:
